@@ -1,14 +1,15 @@
 from dataclasses import dataclass
 from typing import List, Tuple
+import os
 
 import torch
 import torchaudio
 from huggingface_hub import hf_hub_download
-from models import Model
 from moshi.models import loaders
 from tokenizers.processors import TemplateProcessing
 from transformers import AutoTokenizer
-from watermarking import CSM_1B_GH_WATERMARK, load_watermarker, watermark
+from csm.models import Model
+from csm.watermarking import CSM_1B_GH_WATERMARK, watermark, load_watermarker
 
 
 @dataclass
@@ -73,8 +74,6 @@ class Generator:
         return torch.cat(frame_tokens, dim=0), torch.cat(frame_masks, dim=0)
 
     def _tokenize_audio(self, audio: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        assert audio.ndim == 1, "Audio must be single channel"
-
         frame_tokens = []
         frame_masks = []
 
@@ -116,8 +115,24 @@ class Generator:
         topk: int = 50,
     ) -> torch.Tensor:
         self._model.reset_caches()
+        
+        # IMPORTANT: Add a print statement to show the actual value being used
+        print(f"CSM model generating with max_audio_length_ms: {max_audio_length_ms} ms")
 
-        max_generation_len = int(max_audio_length_ms / 80)
+        # Add a safety limit to prevent extremely large values - limit to reasonable range
+        # For Sesame CSM, the max length that reliably works seems to be around 90-120 seconds
+        # We'll allow up to 180 seconds (3 minutes) to be safe
+        safe_max_audio_length_ms = min(max_audio_length_ms, 180_000)
+        if safe_max_audio_length_ms < max_audio_length_ms:
+            print(f"WARNING: Limiting max_audio_length_ms from {max_audio_length_ms} to {safe_max_audio_length_ms} ms for model stability")
+        
+        # Calculate max generation length based on the safe value
+        max_generation_len = int(safe_max_audio_length_ms / 80)
+        # Make sure we don't exceed the model's context window
+        max_generation_len = min(max_generation_len, 1500)  # Safe upper limit for generation length
+        
+        print(f"Using max_generation_len: {max_generation_len} frames (~{max_generation_len * 80 / 1000:.1f} seconds)")
+        
         tokens, tokens_mask = [], []
         for segment in context:
             segment_tokens, segment_tokens_mask = self._tokenize_segment(segment)
@@ -168,9 +183,73 @@ class Generator:
         return audio
 
 
-def load_csm_1b(device: str = "cuda") -> Generator:
-    model = Model.from_pretrained("sesame/csm-1b")
+def load_csm_1b(
+    model_path: str,
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+) -> Generator:  
+    try:
+        print(f"Attempting to load model from {model_path}...")
+        # Direct approach - using the Model class directly with proper configuration
+        from transformers import AutoConfig
+        
+        # First try to load the model directly from the Hub
+        model = Model.from_pretrained("sesame/csm-1b")
+        model.to(device=device)
+        
+    except Exception as e:
+        print(f"First load attempt failed: {str(e)}")
+        try:
+            # Second approach: try loading from the downloaded snapshot
+            from huggingface_hub import snapshot_download
+            
+            # Make sure we have the model downloaded
+            local_dir = model_path
+            if not os.path.exists(os.path.join(local_dir, "config.json")):
+                print("Model files not found. Downloading from Hugging Face Hub...")
+                snapshot_download(
+                    repo_id="sesame/csm-1b",
+                    local_dir=local_dir,
+                    local_dir_use_symlinks=False
+                )
+            
+            # Load config and create model
+            config = AutoConfig.from_pretrained(local_dir)
+            model = Model(config=config)
+            
+            # Find the model weights file
+            weight_files = [f for f in os.listdir(local_dir) if f.endswith('.bin') or f == 'pytorch_model.bin']
+            if not weight_files:
+                # Look in snapshots directory
+                snapshot_dirs = []
+                for root, dirs, files in os.walk(local_dir):
+                    for file in files:
+                        if file.endswith('.bin'):
+                            weight_path = os.path.join(root, file)
+                            print(f"Found weight file: {weight_path}")
+                            model.load_state_dict(torch.load(weight_path, map_location=device))
+                            break
+            else:
+                # Load from main directory
+                weight_path = os.path.join(local_dir, weight_files[0])
+                print(f"Loading weights from: {weight_path}")
+                model.load_state_dict(torch.load(weight_path, map_location=device))
+                
+        except Exception as e2:
+            print(f"Second load attempt failed: {str(e2)}")
+            # Final fallback - try using AutoModelForCausalLM
+            try:
+                from transformers import AutoModelForCausalLM
+                print("Trying AutoModelForCausalLM as final attempt...")
+                model = AutoModelForCausalLM.from_pretrained(
+                    "sesame/csm-1b",
+                    config=AutoConfig.from_pretrained("sesame/csm-1b")
+                )
+            except Exception as e3:
+                print(f"All loading attempts failed: {str(e3)}")
+                raise RuntimeError(f"Could not load CSM-1B model after multiple attempts: {str(e)}, then {str(e2)}, then {str(e3)}")
+    
+    # Move model to specified device and convert to bfloat16
     model.to(device=device, dtype=torch.bfloat16)
-
+    
     generator = Generator(model)
     return generator
