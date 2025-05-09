@@ -11,7 +11,7 @@ with open(os.path.join(os.path.abspath(os.path.dirname(__file__)), 'README.md'),
 
 setup(
     name='nstut-csm-fork',
-    version='0.1.1', # Incrementing version for new release
+    version='0.1.2', 
     author='NsTut',
     author_email='nstut123@gmail.com',
     description='Fork of CSM for text-to-speech synthesis.',
